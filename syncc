@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+#   Añade a cron
+#   */2 * * * * syncc
+#
+#
+
+
+source ~/.config/syncc/syncc.conf
+
+
+
+if [ "$1" = "e" ]
+then
+    $EDITOR ~/.config/syncc/syncc.conf
+    exit
+    fi
+
+
+
+if [ "$1" = "md" ]
+then
+		mkdir -p ~/.config/syncc/mount/
+    rclone mount $(echo "$MD" |   sed 's|\(.*\)/.*|\1/|') ~/.config/syncc/mount  > /dev/null 2>&1 &
+    sleep 3
+    $EDITOR ~/.config/syncc/mount/$(echo "$MD" |  sed 's/.*\///')
+    fusermount -uz ~/.config/syncc/mount/
+    exit
+    fi
+
+
+
+MD_FILE=$(rclone cat "$MD")
+CHECK=$(echo "$MD_FILE" | grep -oP '^\s*-\s*\[\s*x\s*\]\s*\K.*' |  sed '/^ *$/d' )
+
+
+
+
+
+if [ "$CHECK" != "" ]
+then
+
+# RENOMBRO EL ARCHIVO .md
+echo "$MD_FILE"  | sed 's/- \[x\] /- [ ] /g' | rclone rcat $MD
+
+
+while read LINEA ; do
+
+if [ "$(echo $CHECK | grep $LINEA)" != "" ] ; then
+LISTA=$(cat  ~/.config/syncc/syncc.conf    | grep "^COMMAND" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f1 )
+echo "--------------------------"
+echo "Opción : $LINEA"
+echo "Comando: $(cat  ~/.config/syncc/syncc.conf    | grep "$LINEA" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f2)"
+echo "--------------------------"
+echo ""
+echo ""
+COMANDO="$(cat  ~/.config/syncc/syncc.conf    | grep "$LINEA" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f2)"
+source ~/.config/syncc/syncc.conf
+eval "${NOTIFICATIONS}"
+eval "${COMANDO}"
+
+CMD=$(echo "$(date +'%Y/%m/%d %T')  :  $LINEA")
+echo -e "$(rclone cat $LOG)\n$CMD" | rclone rcat $LOG
+fi
+
+
+done <<< "$(cat  ~/.config/syncc/syncc.conf    | grep "^COMMAND" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f1 )"
+exit
+fi
+
+
+if [ "$1" = "h" ]
+then
+    echo "syncc  >>  Comprobar si hay una tarea pendiente  "
+    echo "e      >>  Editar archivo de configuración"
+		echo "md     >>  Editar lista en archivo markdown"
+    echo "log    >>  Ver logs"
+		echo ""
+		echo "Lista"
+    echo "-------------------------------------------------"
+    echo "$MD_FILE"
+
+    exit
+   fi
+
+
+if [ "$1" = "log" ]
+then
+rclone cat $LOG
+    exit
+   fi
+
