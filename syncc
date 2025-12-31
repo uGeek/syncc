@@ -3,90 +3,149 @@
 #   Añade a cron
 #   */2 * * * * syncc
 #
-#
-
 
 source ~/.config/syncc/syncc.conf
 
-
-
-if [ "$1" = "e" ]
-then
+# --- MODO EDICIÓN CONFIGURACIÓN ---
+if [ "$1" = "e" ]; then
     $EDITOR ~/.config/syncc/syncc.conf
     exit
-    fi
+fi
 
-
-
-if [ "$1" = "md" ]
-then
-		mkdir -p ~/.config/syncc/mount/
-    rclone mount $(echo "$MD" |   sed 's|\(.*\)/.*|\1/|') ~/.config/syncc/mount  > /dev/null 2>&1 &
+# --- MODO EDICIÓN MARKDOWN (MOUNT) ---
+if [ "$1" = "md" ]; then
+    mkdir -p ~/.config/syncc/mount/
+    rclone mount "$(echo "$MD" | sed 's|\(.*\)/.*|\1/|')" ~/.config/syncc/mount > /dev/null 2>&1 &
     sleep 3
-    $EDITOR ~/.config/syncc/mount/$(echo "$MD" |  sed 's/.*\///')
+    $EDITOR ~/.config/syncc/mount/$(echo "$MD" | sed 's/.*\///')
     fusermount -uz ~/.config/syncc/mount/
     exit
+fi
+
+# --- NUEVA OPCIÓN: COMMAND ---
+if [ "$1" = "command" ]; then
+    # Buscamos todas las líneas que empiezan por COMMAND
+    grep "^COMMAND" ~/.config/syncc/syncc.conf | while read -r CONF_LINE; do
+        
+        # Limpiamos posibles retornos de carro (Windows)
+        CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
+
+        # Extraemos todo lo que hay después del signo igual
+        VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
+
+        # Quitamos comillas dobles o simples del principio y del final
+        VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+
+        # El nombre es lo que hay antes de la primera coma (limpiando espacios alrededor)
+        NAME=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        # El comando es todo lo que hay después de la primera coma
+        CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
+
+        # Imprimimos en el formato solicitado: nombre: comando
+        echo "${NAME}: ${CMD}"
+    done
+    exit
+fi
+
+# --- LECTURA DEL ARCHIVO REMOTO ---
+if [ -z "$1" ]; then
+    # tr -d '\r' elimina retornos de carro de Windows por seguridad
+    MD_CONTENT=$(rclone cat "$MD" | tr -d '\r')
+    
+    # Buscamos todas las tareas marcadas con [x]
+    CHECK=$(echo "$MD_CONTENT" | grep -oP '^\s*-\s*\[\s*x\s*\]\s*\K.*' | sed '/^ *$/d')
+
+    if [ "$CHECK" != "" ]; then
+
+        # Leemos la lista de tareas marcadas línea por línea
+        echo "$CHECK" | while read -r LINEA_RAW; do
+            
+            [ -z "$LINEA_RAW" ] && continue
+
+            # 1. LIMPIEZA EXTREMA DEL NOMBRE DE LA TAREA (MARKDOWN)
+            LINEA=$(echo "$LINEA_RAW" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            # 2. DESMARCAR EN LA NUBE
+            CURRENT_MD=$(rclone cat "$MD")
+            NEW_MD=$(echo "$CURRENT_MD" | sed "s|\- \[x\] $LINEA_RAW|\- [ ] $LINEA_RAW|")
+            echo "$NEW_MD" | rclone rcat "$MD"
+
+            # 3. BUSCAR COMANDO (MÉTODO ROBUSTO)
+            ENCONTRADO=0
+            COMANDO_A_EJECUTAR=""
+
+            while read -r CONF_LINE; do
+                CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
+                VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
+                VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+                CONF_NOMBRE=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                CONF_CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
+
+                if [ "$CONF_NOMBRE" == "$LINEA" ]; then
+                    COMANDO_A_EJECUTAR="$CONF_CMD"
+                    ENCONTRADO=1
+                    break
+                fi
+            done < <(grep "^COMMAND" ~/.config/syncc/syncc.conf)
+
+            if [ $ENCONTRADO -eq 1 ]; then
+                echo "--------------------------"
+                echo "Procesando: $LINEA"
+                echo "Comando   : $COMANDO_A_EJECUTAR"
+                echo "--------------------------"
+                
+                source ~/.config/syncc/syncc.conf
+                eval "${NOTIFICATIONS}" 2>/dev/null
+                bash -c "$COMANDO_A_EJECUTAR"
+
+                # 4. LOG
+                TIMESTAMP=$(date +'%Y/%m/%d %T')
+                LOG_ENTRY="$TIMESTAMP : $LINEA [Ejecutado: $COMANDO_A_EJECUTAR]"
+                echo -e "$(rclone cat "$LOG")\n$LOG_ENTRY" | rclone rcat "$LOG"
+                
+            else
+                echo "ADVERTENCIA: No se encontró comando para la tarea: [$LINEA]"
+            fi
+        done
+        exit
     fi
-
-
-
-MD_FILE=$(rclone cat "$MD")
-CHECK=$(echo "$MD_FILE" | grep -oP '^\s*-\s*\[\s*x\s*\]\s*\K.*' |  sed '/^ *$/d' )
-
-
-
-
-
-if [ "$CHECK" != "" ]
-then
-
-# RENOMBRO EL ARCHIVO .md
-echo "$MD_FILE"  | sed 's/- \[x\] /- [ ] /g' | rclone rcat $MD
-
-
-while read LINEA ; do
-
-if [ "$(echo $CHECK | grep $LINEA)" != "" ] ; then
-LISTA=$(cat  ~/.config/syncc/syncc.conf    | grep "^COMMAND" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f1 )
-echo "--------------------------"
-echo "Opción : $LINEA"
-echo "Comando: $(cat  ~/.config/syncc/syncc.conf    | grep "$LINEA" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f2)"
-echo "--------------------------"
-echo ""
-echo ""
-COMANDO="$(cat  ~/.config/syncc/syncc.conf    | grep "$LINEA" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f2)"
-source ~/.config/syncc/syncc.conf
-eval "${NOTIFICATIONS}"
-eval "${COMANDO}"
-
-CMD=$(echo "$(date +'%Y/%m/%d %T')  :  $LINEA")
-echo -e "$(rclone cat $LOG)\n$CMD" | rclone rcat $LOG
 fi
 
+# --- MODO AYUDA ---
+if [ "$1" = "h" ]; then
+    echo "================================================="
+    echo "               AYUDA - SYNCC                     "
+    echo "================================================="
+    echo " command >>  Listar tareas simples (nombre: comando)"
+    echo " e       >>  Editar archivo de configuración"
+    echo " md      >>  Editar lista en archivo markdown"
+    echo " log     >>  Ver logs"
+    echo ""
+    echo "=== TAREAS DEFINIDAS (syncc.conf) ==="
+    
+    grep "^COMMAND" ~/.config/syncc/syncc.conf | while read -r CONF_LINE; do
+        CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
+        VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
+        VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        
+        NAME=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
+        
+        echo " Tarea  : $NAME"
+        echo " Comando: $CMD"
+        echo " ................................................"
+    done
 
-done <<< "$(cat  ~/.config/syncc/syncc.conf    | grep "^COMMAND" | cut -d "=" -f2- |  tr -d \"  | cut -d, -f1 )"
-exit
+    echo ""
+    echo "=== ESTADO ACTUAL (Nube) ==="
+    rclone cat "$MD"
+    echo "================================================="
+    exit
 fi
 
-
-if [ "$1" = "h" ]
-then
-    echo "syncc  >>  Comprobar si hay una tarea pendiente  "
-    echo "e      >>  Editar archivo de configuración"
-		echo "md     >>  Editar lista en archivo markdown"
-    echo "log    >>  Ver logs"
-		echo ""
-		echo "Lista"
-    echo "-------------------------------------------------"
-    echo "$MD_FILE"
-
+# --- MODO LOG ---
+if [ "$1" = "log" ]; then
+    rclone cat "$LOG"
     exit
-   fi
-
-
-if [ "$1" = "log" ]
-then
-rclone cat $LOG
-    exit
-   fi
-
+fi
