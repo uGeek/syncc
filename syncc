@@ -1,14 +1,159 @@
 #!/bin/bash
 #
-#   Añade a cron
+#   Añade a cron (modo normal)
 #   */2 * * * * syncc
 #
+#   O ejecuta en modo servicio (daemon)
+#   syncc daemon
+#
 
-source ~/.config/syncc/syncc.conf
+# Definimos la ruta del archivo de configuración
+CONFIG="~/.config/syncc/syncc.conf"
+
+source "$CONFIG"
+
+# --- FUNCIÓN: GESTIONAR ROTACIÓN DE LOG ---
+# Comprueba si el log supera 341.33 KiB (349522 bytes) y reduce líneas a la mitad
+gestionar_rotacion_log() {
+    # 341.33 KiB * 1024 = 349521.92 bytes -> Redondeamos a 349522
+    LIMIT_BYTES=349522
+    
+    # Obtenemos el tamaño actual en bytes (formato JSON para precisión)
+    # Usamos sed para extraer solo el número del campo "bytes"
+    CURRENT_SIZE=$(rclone size "$LOG" --json 2>/dev/null | sed -n 's/.*"bytes": \([0-9]*\).*/\1/p')
+    
+    # Si falla la obtención del tamaño, asumimos 0
+    if [ -z "$CURRENT_SIZE" ]; then CURRENT_SIZE=0; fi
+
+    if [ "$CURRENT_SIZE" -gt "$LIMIT_BYTES" ]; then
+        # echo "El log pesa $CURRENT_SIZE bytes. Rotando..."
+        
+        # Leemos el contenido actual
+        CONTENT=$(rclone cat "$LOG")
+        
+        # Contamos líneas
+        TOTAL_LINES=$(echo "$CONTENT" | wc -l)
+        
+        # Calculamos la mitad
+        LINES_TO_KEEP=$((TOTAL_LINES / 2))
+        
+        if [ "$LINES_TO_KEEP" -gt 0 ]; then
+            # Mantenemos las últimas N líneas (tail) y sobrescribimos el log
+            echo "$CONTENT" | tail -n "$LINES_TO_KEEP" | rclone rcat "$LOG"
+        fi
+    fi
+}
+
+# --- FUNCIÓN PRINCIPAL: PROCESAR TAREAS ---
+procesar_tareas() {
+    # Recargamos la configuración para asegurar variables frescas
+    if [ -f "$CONFIG" ]; then source "$CONFIG"; fi
+
+    MD_CONTENT=$(rclone cat "$MD" | tr -d '\r')
+    
+    # Buscamos líneas marcadas con [x]
+    CHECK=$(echo "$MD_CONTENT" | grep -oP '^\s*-\s*\[\s*x\s*\]\s*\K.*' | sed '/^ *$/d')
+
+    if [ "$CHECK" != "" ]; then
+
+        echo "$CHECK" | while read -r LINEA_RAW; do
+            
+            [ -z "$LINEA_RAW" ] && continue
+
+            # 1. LIMPIEZA
+            LINEA=$(echo "$LINEA_RAW" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            # 2. DESMARCAR EN LA NUBE (Antes de ejecutar)
+            CURRENT_MD=$(rclone cat "$MD")
+
+            # Verificamos si es un comando manual (>_)
+            if [[ "$LINEA" == \>\_\ * ]]; then
+                # ES MANUAL: Borramos la línea completa del archivo
+                NEW_MD=$(echo "$CURRENT_MD" | grep -vF "$LINEA_RAW")
+            else
+                # ES NORMAL: Solo desmarcamos [x] -> [ ]
+                NEW_MD=$(echo "$CURRENT_MD" | sed "s|\- \[x\] $LINEA_RAW|\- [ ] $LINEA_RAW|")
+            fi
+            
+            # Subimos cambios
+            echo "$NEW_MD" | rclone rcat "$MD"
+
+            # 3. IDENTIFICAR TIPO DE TAREA Y BUSCAR COMANDO
+            ENCONTRADO=0
+            COMANDO_A_EJECUTAR=""
+
+            # --- CASO A: COMANDO MANUAL (Empieza por >_) ---
+            if [[ "$LINEA" == \>\_\ * ]]; then
+                # Quitamos el prefijo ">_ " (los primeros 3 caracteres)
+                COMANDO_A_EJECUTAR="${LINEA:3}"
+                echo "Detectado comando manual: $COMANDO_A_EJECUTAR"
+                ENCONTRADO=1
+            
+            # --- CASO B: TAREA PREDEFINIDA (Buscar en syncc.conf) ---
+            else
+                while read -r CONF_LINE; do
+                    CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
+                    VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
+                    VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+                    CONF_NOMBRE=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    CONF_CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
+
+                    if [ "$CONF_NOMBRE" == "$LINEA" ]; then
+                        COMANDO_A_EJECUTAR="$CONF_CMD"
+                        ENCONTRADO=1
+                        break
+                    fi
+                done < <(grep "^COMMAND" "$CONFIG")
+            fi
+
+            # 4. EJECUCIÓN
+            if [ $ENCONTRADO -eq 1 ]; then
+                # Calculamos la fecha AHORA
+                TIMESTAMP=$(date +'%Y/%m/%d %T')
+                
+                echo "--------------------------"
+                echo "Procesando: $LINEA"
+                echo "Comando   : $COMANDO_A_EJECUTAR"
+                echo "Fecha     : $TIMESTAMP"
+                echo "--------------------------"
+                
+                # Ejecutar notificaciones opcionales
+                eval "${NOTIFICATIONS}" 2>/dev/null
+                
+                # --- EJECUCIÓN Y CAPTURA DE SALIDA ---
+                # Ejecutamos bash capturando stdout y stderr (2>&1)
+                CMD_OUTPUT=$(bash -c "$COMANDO_A_EJECUTAR" 2>&1)
+                
+                # Si la salida está vacía, indicarlo
+                if [ -z "$CMD_OUTPUT" ]; then
+                    CMD_OUTPUT="(Comando ejecutado correctamente sin salida en terminal)"
+                fi
+
+                # 5. LOGGING (Formato especial para lectura web)
+                # Header normal para lectura humana
+                HEADER="$TIMESTAMP : $LINEA [Ejecutado: $COMANDO_A_EJECUTAR]"
+                
+                # Bloques delimitadores para el parser JS
+                BLOCK_START=">>> OUTPUT:"
+                BLOCK_END="<<< END_OUTPUT"
+                
+                # Leemos log actual y añadimos lo nuevo al final
+                FULL_LOG="$(rclone cat "$LOG")"
+                echo -e "$FULL_LOG\n$HEADER\n$BLOCK_START\n$CMD_OUTPUT\n$BLOCK_END" | rclone rcat "$LOG"
+                
+                # 6. ROTACIÓN DE LOG (Limpieza si es muy grande)
+                gestionar_rotacion_log
+
+            else
+                echo "ADVERTENCIA: No se encontró comando para la tarea: [$LINEA]"
+            fi
+        done
+    fi
+}
 
 # --- MODO EDICIÓN CONFIGURACIÓN ---
 if [ "$1" = "e" ]; then
-    $EDITOR ~/.config/syncc/syncc.conf
+    $EDITOR "$CONFIG"
     exit
 fi
 
@@ -22,94 +167,70 @@ if [ "$1" = "md" ]; then
     exit
 fi
 
-# --- NUEVA OPCIÓN: COMMAND ---
+# --- MODO COMMAND (LISTAR TAREAS SIMPLES) ---
 if [ "$1" = "command" ]; then
-    # Buscamos todas las líneas que empiezan por COMMAND
-    grep "^COMMAND" ~/.config/syncc/syncc.conf | while read -r CONF_LINE; do
-        
-        # Limpiamos posibles retornos de carro (Windows)
+    grep "^COMMAND" "$CONFIG" | while read -r CONF_LINE; do
         CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
-
-        # Extraemos todo lo que hay después del signo igual
         VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
-
-        # Quitamos comillas dobles o simples del principio y del final
         VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-
-        # El nombre es lo que hay antes de la primera coma (limpiando espacios alrededor)
         NAME=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-        # El comando es todo lo que hay después de la primera coma
         CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
-
-        # Imprimimos en el formato solicitado: nombre: comando
         echo "${NAME}: ${CMD}"
     done
     exit
 fi
 
-# --- LECTURA DEL ARCHIVO REMOTO ---
-if [ -z "$1" ]; then
-    # tr -d '\r' elimina retornos de carro de Windows por seguridad
-    MD_CONTENT=$(rclone cat "$MD" | tr -d '\r')
+# --- MODO DAEMON (BUCLE INFINITO) ---
+if [ "$1" = "daemon" ]; then
+    # 1. Registrar hora de inicio (Variable local)
+    START_TIME=$(date +'%Y/%m/%d %T')
     
-    # Buscamos todas las tareas marcadas con [x]
-    CHECK=$(echo "$MD_CONTENT" | grep -oP '^\s*-\s*\[\s*x\s*\]\s*\K.*' | sed '/^ *$/d')
-
-    if [ "$CHECK" != "" ]; then
-
-        # Leemos la lista de tareas marcadas línea por línea
-        echo "$CHECK" | while read -r LINEA_RAW; do
-            
-            [ -z "$LINEA_RAW" ] && continue
-
-            # 1. LIMPIEZA EXTREMA DEL NOMBRE DE LA TAREA (MARKDOWN)
-            LINEA=$(echo "$LINEA_RAW" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-            # 2. DESMARCAR EN LA NUBE
-            CURRENT_MD=$(rclone cat "$MD")
-            NEW_MD=$(echo "$CURRENT_MD" | sed "s|\- \[x\] $LINEA_RAW|\- [ ] $LINEA_RAW|")
-            echo "$NEW_MD" | rclone rcat "$MD"
-
-            # 3. BUSCAR COMANDO (MÉTODO ROBUSTO)
-            ENCONTRADO=0
-            COMANDO_A_EJECUTAR=""
-
-            while read -r CONF_LINE; do
-                CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
-                VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
-                VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-                CONF_NOMBRE=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                CONF_CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
-
-                if [ "$CONF_NOMBRE" == "$LINEA" ]; then
-                    COMANDO_A_EJECUTAR="$CONF_CMD"
-                    ENCONTRADO=1
-                    break
-                fi
-            done < <(grep "^COMMAND" ~/.config/syncc/syncc.conf)
-
-            if [ $ENCONTRADO -eq 1 ]; then
-                echo "--------------------------"
-                echo "Procesando: $LINEA"
-                echo "Comando   : $COMANDO_A_EJECUTAR"
-                echo "--------------------------"
-                
-                source ~/.config/syncc/syncc.conf
-                eval "${NOTIFICATIONS}" 2>/dev/null
-                bash -c "$COMANDO_A_EJECUTAR"
-
-                # 4. LOG
-                TIMESTAMP=$(date +'%Y/%m/%d %T')
-                LOG_ENTRY="$TIMESTAMP : $LINEA [Ejecutado: $COMANDO_A_EJECUTAR]"
-                echo -e "$(rclone cat "$LOG")\n$LOG_ENTRY" | rclone rcat "$LOG"
-                
-            else
-                echo "ADVERTENCIA: No se encontró comando para la tarea: [$LINEA]"
-            fi
-        done
-        exit
+    # 2. Actualizar syncc.conf con la variable DEAMON
+    # Si existe la reemplaza, si no la añade
+    if grep -q "^DEAMON=" "$CONFIG"; then
+        sed -i "s|^DEAMON=.*|DEAMON=\"$START_TIME\"|" "$CONFIG"
+    else
+        echo "" >> "$CONFIG"
+        echo "DEAMON=\"$START_TIME\"" >> "$CONFIG"
     fi
+
+    # 3. Registrar inicio en el LOG remoto
+    # Recargamos config para asegurar variables
+    source "$CONFIG"
+    INTERVALO=${TIEMPO:-60}
+    
+    LOG_MSG="$START_TIME : *** INICIO MODO DAEMON (Intervalo: ${INTERVALO}s) ***"
+    echo -e "$(rclone cat "$LOG")\n$LOG_MSG" | rclone rcat "$LOG"
+    
+    # Comprobar rotación al iniciar también
+    gestionar_rotacion_log
+    
+    # 4. Mensaje en pantalla
+    echo "================================================="
+    echo " INICIANDO SYNCC DAEMON"
+    echo " Inicio registrado : $START_TIME"
+    echo " Intervalo         : ${INTERVALO} segundos"
+    echo " Log actualizado   : $LOG"
+    echo " Pulsa Ctrl+C para detener"
+    echo "================================================="
+
+    # 5. Bucle Principal
+    while true; do
+        procesar_tareas
+        
+        # Volvemos a leer la configuración por si TIEMPO cambió en caliente
+        if [ -f "$CONFIG" ]; then source "$CONFIG"; fi
+        INTERVALO=${TIEMPO:-60}
+        
+        sleep "$INTERVALO"
+    done
+    exit
+fi
+
+# --- MODO CRON / EJECUCIÓN ÚNICA (Default) ---
+if [ -z "$1" ]; then
+    procesar_tareas
+    exit
 fi
 
 # --- MODO AYUDA ---
@@ -117,26 +238,14 @@ if [ "$1" = "h" ]; then
     echo "================================================="
     echo "               AYUDA - SYNCC                     "
     echo "================================================="
-    echo " command >>  Listar tareas simples (nombre: comando)"
+    echo " command >>  Listar tareas simples"
+    echo " daemon  >>  Ejecutar en bucle (Registra inicio en .conf y log)"
     echo " e       >>  Editar archivo de configuración"
     echo " md      >>  Editar lista en archivo markdown"
     echo " log     >>  Ver logs"
     echo ""
     echo "=== TAREAS DEFINIDAS (syncc.conf) ==="
-    
-    grep "^COMMAND" ~/.config/syncc/syncc.conf | while read -r CONF_LINE; do
-        CONF_LINE=$(echo "$CONF_LINE" | tr -d '\r')
-        VALOR=$(echo "$CONF_LINE" | cut -d'=' -f2-)
-        VALOR_LIMPIO=$(echo "$VALOR" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-        
-        NAME=$(echo "$VALOR_LIMPIO" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        CMD=$(echo "$VALOR_LIMPIO" | cut -d',' -f2-)
-        
-        echo " Tarea  : $NAME"
-        echo " Comando: $CMD"
-        echo " ................................................"
-    done
-
+    grep "^COMMAND" "$CONFIG" | cut -d'=' -f2- | tr -d '"'
     echo ""
     echo "=== ESTADO ACTUAL (Nube) ==="
     rclone cat "$MD"
